@@ -17,18 +17,20 @@ Success is one MIT-clean `GWBASIC.EXE` that anyone can rebuild bit for bit on Li
 
 **Goals**
 
-1. Vendor Microsoft's source unmodified, pinned to upstream commit `edf82c2`, with its MIT notice and a provenance record in the style of GR-DOS `docs/provenance.md`.
-2. Supply the missing OEM layer (IBM PC screen, keyboard, sound, graphics and device glue) as separately licensed, clearly attributed files.
+1. Vendor Microsoft's source unmodified, pinned to upstream commit `edf82c2`, as a plain copy with its commit and tree hashes, its MIT notice and a provenance record in the style of GR-DOS `docs/provenance.md`.
+2. Supply the missing OEM layer (IBM PC screen, keyboard, sound, graphics and device glue) as independently written, separately licensed, clearly attributed files.
 3. Build with GR-DOS's pinned JWasm v2.20 plus its patches and Open Watcom `wlink`. The build must be deterministic, checked by a committed sha256 manifest.
-4. Use 8086/8088 instructions only, and run under GR-DOS in QEMU. Run a smoke test on real PC/XT hardware later.
-5. Document how this 1983 dialect differs from later GW-BASIC releases (3.2x).
-6. Hand GR-DOS a release zip with the binary, `LICENSE`, `NOTICE` and the source, for its full distribution and HELP inventory.
+4. Use 8086/8088 instructions only: checked statically at build time, then confirmed by a run on a real 8088.
+5. Run under GR-DOS in QEMU, in the disk layout the full distribution uses.
+6. Document how this 1983 dialect differs from later GW-BASIC releases (3.2x).
+7. Hand GR-DOS a release zip with the binary, `LICENSE`, `NOTICE` and the source, for its full distribution and HELP inventory.
 
 **Non-goals**
 
 - Feature parity with GW-BASIC 3.23. Subdirectory paths, `TIMER`, `CHDIR` and similar features are a later milestone, if we do them at all.
 - A spot on the 360 KB boot floppy.
 - Changing the BASIC language or adding features beyond what is needed to run.
+- Rebranding the interpreter. The original GW-BASIC banner stays; GR-DOS identification goes in package metadata (see Decisions).
 - Byte-identity with a historical IBM or Microsoft binary. No 1983 build exists to compare against, so our own MASM build is the reference.
 
 ## Build architecture
@@ -40,11 +42,12 @@ flowchart TD
     upstream["<b>upstream/</b> (vendored, never edited)<br/>Microsoft 1983 source, MIT, commit edf82c2"]
     oem["<b>src/oem/</b> (written in this repo)<br/>Screen, keyboard, sound and device routines"]
     prepare["<b>Prepare build tree</b><br/>CRLF endings, MATH1 + MATH2 joined as MATH.ASM"]
-    m1["<b>M1 reference build</b> (local)<br/>DOSBox-X running MASM 5.10 and LINK"]
-    m2["<b>M2 Linux build</b> (CI)<br/>Pinned JWasm v2.20 + GR-DOS patches, wlink"]
-    gate{"sha256 identical?"}
-    fail["make check fails"]
-    tests["<b>QEMU tests under GR-DOS</b><br/>Smoke, BASIC corpus, file I/O, via COM1 log"]
+    m1["<b>Reference build</b> (local)<br/>DOSBox-X running MASM 5.10 and LINK"]
+    m2["<b>Linux build</b> (CI)<br/>Pinned JWasm v2.20 + GR-DOS patches, wlink"]
+    gate{"Cross-toolchain<br/>sha256 identical?"}
+    fail["make check fails:<br/>investigate, never weaken"]
+    cpu["<b>8086 static check</b><br/>.8086 assembly + opcode scan"]
+    tests["<b>QEMU tests under GR-DOS</b><br/>Boot floppy + HD image, harness reports on COM1"]
     release["<b>Release zip</b><br/>GWBASIC.EXE, LICENSE, NOTICE, source"]
     grdos["<b>GR-DOS full HD/CF distribution</b><br/>Integrated in gr-dos/gr-dos, not the boot floppy"]
 
@@ -55,75 +58,127 @@ flowchart TD
     m1 --> gate
     m2 --> gate
     gate -- no --> fail
-    gate -- yes --> tests
+    gate -- yes --> cpu
+    cpu --> tests
     tests -- pass --> release
     release --> grdos
 ```
 
-The MASM build exists only to prove the JWasm build correct. CI runs only the Linux build and the QEMU tests.
+The MASM build exists only to prove the JWasm build correct. CI runs only the Linux build, the 8086 check and the QEMU tests.
 
 | Path | Holds |
 | --- | --- |
-| `upstream/` | Microsoft source at `edf82c2`, byte for byte, with its `LICENSE` |
+| `upstream/` | Microsoft source at `edf82c2`, byte for byte, with its `LICENSE`; commit and tree hashes in `docs/provenance.md` |
 | `src/oem/` | Our OEM modules, MIT, with per-file headers |
-| `scripts/` | `prepare-tree`, `reference-build`, `fetch-jwasm`, `fetch-watcom`, `run-tests` (ported from GR-DOS where possible) |
-| `tests/` | `.BAS` corpus and golden output |
-| `docs/` | Provenance, dialect notes, `reference-build.sha256` |
-| `Makefile` | `make` builds `build/GWBASIC.EXE`, `make check` compares builds, `make test` runs QEMU, `make dist` makes the zip |
+| `scripts/` | `prepare-tree`, `reference-build`, `fetch-jwasm`, `fetch-watcom`, `symbol-report`, `check-8086`, `run-tests` (ported from GR-DOS where possible) |
+| `tests/` | `.BAS` corpus, golden output, and the DOS-side harness |
+| `docs/` | Provenance, symbol report, feature matrix, dialect notes, `reference-build.sha256` |
+| `Makefile` | `make` builds `build/GWBASIC.EXE`, `make check` runs both reproducibility checks, `make test` runs QEMU, `make dist` makes the zip |
+
+### Reproducibility checks
+
+These are two separate checks, reported separately by `make check`:
+
+1. **Determinism.** Two clean builds with the same toolchain give identical bytes. This applies to both the MASM build and the Linux build.
+2. **Cross-toolchain identity.** The JWasm/wlink `GWBASIC.EXE` is byte-identical to the MASM/LINK reference. This is the initial and preferred acceptance gate, as it was in GR-DOS.
+
+If toolchain metadata or segment layout makes check 2 impossible, we do not quietly weaken it. We investigate first, as GR-DOS did with its JWasm patches. If a difference cannot be removed, we write an explicit equivalence policy (for example an OMF- or map-level comparison listing every allowed difference) and get it reviewed before `make check` changes.
 
 ## Source gaps and the OEM layer
 
 The main engineering work is filling the OEM gap. A first scan of upstream `edf82c2` found 219 symbols declared `EXTRN` but never defined as a label, `PROC`, data item or equate. This is a rough text scan, so some symbols may be produced by macros we did not expand.
 
-| Group | Count | Examples | Likely source |
+| Group | Count (rough scan) | Examples | Likely source |
 | --- | --- | --- | --- |
 | Hardware routines and state | ~151 | `SCROUT` `SCRINP` `MAPXYC` `SETC` `GWINI` `GWTERM` `KEYINP` `DONOTE` `RDPEN` `INICOM` `CSRX` `LINLEN` | Missing OEM modules: must be written |
 | Token constants | 51 | `$PRINT` `$GOTO` `$ELSE` `$_COM1` | Probably macro-generated from `IBMRES.ASM`; to confirm |
 | Error entry points | 17 | `DERBFM` `DERFNF` `DERIOE` | Probably macro-generated in `GWMAIN.ASM`; to confirm |
 
-We will write our own OEM modules from the upstream interface, guided by the hooks in `OEM.H`, `GIO86U` and `MSDOSU`. They will target IBM PC BIOS calls (`INT 10h`, `16h`, `17h`, `14h`) on CGA and MDA.
+**These counts are not a commitment.** M0 replaces them with an assembler-aware report. `scripts/symbol-report` assembles every upstream module with JWasm, so macros are expanded, and then collects the unresolved externals from a trial link. The report is committed as `docs/symbols.md`, grouped by subsystem, and regenerated in CI so it stays reproducible. M1 is sized from that report, not from the text scan.
 
-TK Chia's `OEM.ASM`, `OEMEV.ASM` and `OEMSND.ASM` are the obvious shortcut. The fork's README says all files are MIT, but its `LICENSE` names only Microsoft, and its vendored JWasm and JWlink carry their own licenses. Until the maintainer confirms that the new files are MIT, we use the fork as a reference only. That means reading it to understand the interface, not copying its code.
+**Licensing decision.** We write our own OEM modules from the upstream interface, guided by the hooks in `OEM.H`, `GIO86U` and `MSDOSU`. They target IBM PC BIOS calls (`INT 10h`, `16h`, `17h`, `14h`) on CGA and MDA.
+
+TK Chia's `OEM.ASM`, `OEMEV.ASM` and `OEMSND.ASM` are an obvious shortcut. The fork's README says all files are MIT, but its `LICENSE` names only Microsoft, and its vendored JWasm and JWlink carry their own licenses. We will ask the maintainer to clarify, but the project does not wait for an answer. Until rights are established, the fork is a technical reference only: we read it to understand the interface and do not copy its code. If the maintainer later confirms MIT terms, reusing parts of it becomes a separate, reviewed change.
 
 The OEM files go in `src/oem/`, separate from the untouched `upstream/` tree, so `NOTICE` can say exactly who wrote what.
 
 ## Testing strategy
 
-Every test runs headless in CI except real-hardware runs. A test passes when an expected marker arrives on COM1, the same way GR-DOS's `reference-boot` works.
+Every test runs headless in CI except real-hardware runs. A test passes when an expected marker arrives on COM1, the same way GR-DOS's `reference-boot` works. **The markers never depend on GW-BASIC's own serial support,** which may stay stubbed for a long time.
+
+### Harness
+
+1. Each `.BAS` test writes its results to a file with `OPEN "O",#1,"RESULT.TXT"` and ends with `SYSTEM`.
+2. A DOS batch harness (`RUN.BAT`) runs each test in turn, then sends `RESULT.TXT` and begin/end markers to COM1 using DOS itself (for example `TYPE RESULT.TXT > AUX`).
+3. On the host, `scripts/run-tests` reads the COM1 log and diffs each result against its golden file.
+
+GW-BASIC writes to the screen through BIOS, so DOS `>` redirection of the interpreter's own output probably captures nothing. The harness therefore relies on result files. Before we depend on it, M1 checks that `SYSTEM` returns cleanly to the batch file and that files written by the interpreter are fully flushed.
+
+### Disk layout
+
+Tests use the layout the full distribution ships with. QEMU boots the frozen 360 KB GR-DOS floppy unchanged as `A:`. A separate HD/CF image is attached as `C:`, holding `GWBASIC.EXE`, the `.BAS` tests and `RUN.BAT`. Nothing assumes the boot floppy can start GW-BASIC by itself. How `RUN.BAT` gets started is decided in M1: either a test-only copy of the floppy whose `AUTOEXEC.BAT` only calls `C:\RUN.BAT`, or booting the full distribution's HD image directly if GR-DOS supports that.
+
+### 8086/8088 validation
+
+- **Static gate (CI).** Every module is assembled under `.8086`, so JWasm rejects 186+ instructions at source level. In addition, `scripts/check-8086` disassembles `GWBASIC.EXE` and scans the code segments for post-8086 opcodes, using the linker map to keep data out of the scan. Disassemblers can misread data as code and miss hand-encoded `DB` instructions, so every hit, and every `DB`-encoded instruction in the source, is reviewed and recorded in an allowlist with its reason.
+- **Real 8088 gate (M5).** A real 8088 PC/XT, or a clone with a true 8088, runs the smoke test and the corpus.
+- QEMU provides functional coverage only. We do not rely on QEMU or any optional 8086-limited CPU model to catch bad opcodes.
+
+### Test layers
 
 | Layer | What it checks | How |
 | --- | --- | --- |
-| Reproducibility | Two clean builds give identical bytes; JWasm matches the MASM reference | `make check` compares against `docs/reference-build.sha256` |
-| 8086 only | No 186+ opcodes in `GWBASIC.EXE` | Disassemble and scan, plus a QEMU run with an 8086-limited CPU model if one is available |
-| Interpreter smoke | Starts, prints banner, `PRINT 2+2`, exits with `SYSTEM` | GR-DOS floppy image + `AUTOEXEC.BAT` running `GWBASIC TEST.BAS`, output to `COM1` |
-| Language corpus | Arithmetic (single/double), strings, `GOSUB`, `ON ERROR`, `DEF FN`, arrays | `tests/*.BAS` with golden output files, diffed |
+| Determinism | Two clean builds with one toolchain are identical | `make check`, part 1 |
+| Cross-toolchain identity | JWasm/wlink output matches the MASM/LINK reference | `make check`, part 2, against `docs/reference-build.sha256` |
+| 8086 only | No post-8086 instructions | `.8086` assembly + `scripts/check-8086` |
+| Interpreter smoke | Starts, `PRINT 2+2` to a result file, exits with `SYSTEM` | Floppy `A:` + HD image `C:`, harness reports on COM1 |
+| Language corpus | Features marked "in" in the feature matrix | `tests/*.BAS` with golden output files, diffed |
 | File I/O | `SAVE`/`LOAD` (tokenised and `,A`), `OPEN`/`PRINT #`/`INPUT #`, random files | Corpus programs that write and read back from disk |
 | Screen and sound | `SCREEN 1/2`, `PSET`, `LINE`, `PLAY`, `SOUND` | Screenshot compare in QEMU; manual on hardware |
-| Hardware | IBM PC/XT or clone, CGA/MDA | Manual checklist each release |
+| Hardware | Real 8088 PC/XT or clone, CGA/MDA | Manual checklist each release |
 
 The corpus can borrow programs from period books that are freely licensed, but each one needs its provenance recorded.
 
+### Defect triage
+
+When tests expose a problem, we first decide whose it is:
+
+- **A GR-DOS kernel incompatibility** (for example an `INT 21h` call from `MSDOSU` that GR-DOS mishandles) is filed in `gr-dos/gr-dos` and cross-linked to #1.
+- **A GW-BASIC OEM defect** is fixed here.
+
+A test that fails because of a kernel issue is marked with that issue's number instead of being worked around in the OEM layer.
+
 ## Milestones
 
-The milestones follow GR-DOS's M0 to M2 sequence, then add the run, package and hardware steps from issue #1. M1 carries the most risk because it needs the whole OEM layer before anything boots.
+The milestones follow GR-DOS's M0 to M2 sequence, then add the run, package and hardware steps from issue #1. M1 carries the most risk, so it is split into four checkpoints that each end in something runnable.
 
 | Milestone | Work | Gate: done when |
 | --- | --- | --- |
-| **M0** Provenance and gap analysis | Vendor upstream, list missing symbols | Provenance and gap list reviewed; TK Chia license answer recorded |
-| **M1** OEM layer + MASM reference | Write `src/oem/`, build under DOSBox-X | `GWBASIC.EXE` starts and prints its banner; two clean MASM builds are identical |
-| **M2** Linux build, byte-identical | JWasm + wlink, `make check` | `make check`: sha256 matches the M1 reference |
-| **M3** Runs on GR-DOS | QEMU smoke, BASIC corpus, file I/O | `make test` green in CI: smoke, corpus, file I/O |
+| **M0** Provenance and gap analysis | Vendor upstream; `scripts/symbol-report`; ask TK Chia about licensing | Provenance reviewed; `docs/symbols.md` committed and reproducible; clarification request recorded with the current licensing decision (no reply needed) |
+| **M1a** Screen + keyboard | Text-mode screen and keyboard OEM routines; MASM reference build stood up | Interpreter reaches the `Ok` prompt and runs `PRINT 2+2` interactively; MASM builds are deterministic |
+| **M1b** DOS and file glue | File and device glue; the test harness | Harness smoke test passes: result file written, `SYSTEM` returns to `RUN.BAT` |
+| **M1c** Graphics | `SCREEN`, `PSET`, `LINE`, `CIRCLE`, `PAINT` on CGA | Graphics corpus programs match reference screenshots |
+| **M1d** Sound and devices | `SOUND`, `PLAY`, printer, serial stubs | Remaining symbols in `docs/symbols.md` are resolved or listed as stubs |
+| **M2** Linux build, byte-identical | JWasm + wlink; `make check`; 8086 static gate | Both reproducibility checks pass, or an equivalence policy is reviewed; `check-8086` is clean |
+| **M3** Runs on GR-DOS | QEMU corpus against the feature matrix | `make test` green in CI; kernel issues filed in `gr-dos/gr-dos` |
 | **M4** Package and integrate | Release zip, PR to `gr-dos/gr-dos` | Zip merged into the GR-DOS full distribution; listed in its HELP inventory |
-| **M5** Hardware + dialect notes | PC/XT smoke test, `docs/dialect.md` | Smoke test passes on a real PC/XT; issue #1 acceptance met |
+| **M5** Hardware + dialect docs | Real 8088 run; user-facing `docs/dialect.md` | Smoke test and corpus pass on a real 8088; dialect docs complete; issue #1 acceptance met |
 
-M0 is small enough to start on `graham/impl` now. It covers vendoring `upstream/`, writing `docs/provenance.md`, committing the symbol-gap scan as a script, and sending the license question to TK Chia.
+**Feature matrix.** A minimal 1983 feature matrix (`docs/features.md`) is started during M1 and must exist before M3. It lists each statement and function as in, out, or stubbed. The M3 corpus tests exactly the features marked "in", and M5 turns the matrix into the user-facing dialect documentation.
+
+M0 is small enough to start on `graham/impl` now.
+
+## Decisions
+
+These were open questions, settled in review of [#2](https://github.com/gr-dos/gw-basic/pull/2):
+
+- **Vendoring:** a plain copy of upstream with its commit and tree hashes and a provenance record, as in GR-DOS. No submodule or subtree.
+- **Binaries:** one `GWBASIC.EXE` to start with. No `GWBASICA.EXE` variant.
+- **Banner:** keep the original GW-BASIC banner. GR-DOS branding goes in package metadata, or in an optional build identifier that is clearly separate from the original banner. It is never a functional patch.
+- **TK Chia code:** we write our own OEM layer. We ask for clarification, but nothing blocks on the reply, and we copy nothing until rights are established.
 
 ## Open questions
 
-- [ ] Reuse TK Chia's OEM files or write our own? Ask the maintainer to confirm in writing that `OEM.ASM`, `OEMEV.ASM` and `OEMSND.ASM` are MIT.
-- [ ] How should we vendor upstream: a git submodule, a subtree, or a plain copy with its tree hash recorded? GR-DOS used a plain copy.
-- [ ] Do the `$` token and `DER` error symbols really come from macros? Expanding `IBMRES.ASM` and `GWMAIN.ASM` with JWasm `-EP` would settle it.
-- [ ] Ship one binary or two? TK Chia ships `GWBASIC.EXE` plus a `GWBASICA.EXE` with post-1983 extras. Our proposal is one binary for v1.
 - [ ] Where does the MASM 5.10 reference toolchain come from? Can we reuse GR-DOS's `TOOLS` binaries and DOSBox-X script?
-- [ ] Which GR-DOS kernel gaps will GW-BASIC hit? Track candidates such as the `INT 21h` calls used by `MSDOSU` in `gr-dos/gr-dos` once smoke tests run.
-- [ ] Should the version banner say GR-DOS, the way COMMAND.COM's branding patch does?
+- [ ] How should `RUN.BAT` start in tests: a test-only floppy copy, or booting the full distribution's HD image (see Disk layout)?
+- [ ] Which GR-DOS kernel gaps will GW-BASIC hit? M3 will show us; see Defect triage.
