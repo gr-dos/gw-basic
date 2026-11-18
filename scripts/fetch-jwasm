@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# Build GR-DOS's pinned and patched JWasm (scripts/fetch-grdos).
+# Prints the path of the jwasm executable on stdout.
+#
+# usage: scripts/fetch-jwasm [DESTDIR]     (default: build/tools)
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+dest=${1:-"$root/build/tools"}
+grdos=$("$root/scripts/fetch-grdos" "$dest")
+exec "$grdos/scripts/fetch-jwasm" "$dest"

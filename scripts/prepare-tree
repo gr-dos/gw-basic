@@ -1,0 +1,311 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+use File::Path qw( make_path remove_tree );
+
+# ABSTRACT: Prepare an assemblable copy of the upstream GW-BASIC source
+
+=head1 SYNOPSIS
+
+ scripts/prepare-tree [DESTDIR]     (default: build/src)
+
+=head1 DESCRIPTION
+
+Copies the vendored C<upstream/> tree to DESTDIR and applies the mechanical
+rewrites that a modern assembler needs. C<upstream/> itself is never
+modified. Every rewrite is listed in C<DESTDIR/PREPARE.LOG> as
+C<FILE(LINE) RULE: old =E<gt> new>, so a reviewer can audit each change.
+
+The 1983 source was produced by Microsoft's own translator and assembler
+(C<This translation created 10-Feb-83 by Version 4.3>). It uses names that
+later assemblers reserve. The rules below handle that, and nothing else:
+
+=over 4
+
+=item C<join-math>
+
+C<MATH.ASM> is C<MATH1.ASM> followed by C<MATH2.ASM>. C<MATH1.ASM> ends in
+NUL padding, which is dropped. C<MATH2.ASM> has no header of its own and
+continues the same segment.
+
+=item C<rename-symbol>
+
+A symbol whose name is an instruction (C<PUSHF>, C<IDIV>, C<LOOP>, C<FDIV>, ...) or a
+directive (C<NAME>, C<OPTION>, C<FOR>, ...) of a later assembler gets a
+trailing C<_>. An instruction word in mnemonic position stays as it is. The
+reserved-word macros C<Q>, C<QF>, C<T> and C<un_def> spell the keyword's
+text from their argument, so their lines are never renamed. The keyword's
+token symbol (C<$NAME>) does not change.
+
+=item C<r-to-r2>
+
+C<R X>, where C<X> is renamed, becomes C<R2 X,X_>. C<R> declares and
+dispatches to a routine of the same name as the keyword; C<R2> takes the
+two names separately, so the token symbol stays C<$X> while the routine
+becomes C<X_>.
+
+=item C<rename-switch>
+
+An assembly-time switch named C<SHORT>, C<LENGTH> or C<LABEL> gets a
+trailing C<_> where it is assigned and inside C<IF>-family conditions. Its
+uses as an operator or directive (C<JMP SHORT>, C<X LABEL NEAR>) stay.
+
+=item C<forward-equate>
+
+An assignment C<NAME=expr> that uses a symbol defined further down the same
+file moves to just below the last such definition. The 1983 assembler
+resolved these on its second pass; JWasm evaluates C<=> where it stands.
+This applies only to the files that need it: C<ADVGRP.ASM> (C<PWR2PX>,
+computed from switches assigned after it) and C<GWDATA.ASM> (C<CNSLEN>,
+C<FILDEV>, ... computed from labels defined after them).
+
+=item C<marker-equate>
+
+C<BINTRP.H> marks each dispatch routine that may need an C<EXTRN> by
+defining an empty macro C<?name>, written as C<?&s macro> followed by
+C<&endm> inside another macro. JWasm does not follow that nesting trick.
+The marker is only ever tested with C<IFNDEF>, so it becomes the equate
+C<?&s = 1>.
+
+=item C<byte-offset>
+
+C<OFFSET X> used as a byte (a token value or an error number) becomes
+C<LOW (OFFSET X)>: in C<DB OFFSET X>, and as the source of an instruction
+whose destination is an 8-bit register (C<MOV DL,OFFSET ERR&X> in
+C<DERMAK>). The 1983 assembler truncated silently; JWasm rejects the
+implicit truncation.
+
+=item C<movs-cs>
+
+C<MOVS ?CSLAB,WORD PTR ?CSLAB> uses the dummy label C<?CSLAB> to ask for a
+C<CS:> override on the source. It becomes the explicit
+C<MOVS WORD PTR ES:[DI],WORD PTR CS:[SI]>, which encodes the same
+instruction (C<2E A5>).
+
+=back
+
+=cut
+
+my $root = do { my $d = $0 =~ s{/[^/]*$}{}r; "$d/.." };
+my $src  = "$root/upstream";
+my $dest = shift // "$root/build/src";
+
+my @insn = qw( PUSHF IDIV INT NEG LOOP FDIV FCOMP FADD FSUB FFREE );
+my @dirv = qw( NAME OPTION FOR WHILE GOTO INSTR );
+my @swit = qw( SHORT LENGTH LABEL );
+
+my %insn = map { $_ => 1 } @insn;
+my %sym  = map { $_ => 1 } @insn, @dirv;
+my %swit = map { $_ => 1 } @swit;
+my %forward_files = map { $_ => 1 } qw( ADVGRP.ASM GWDATA.ASM );
+
+my $id = qr/[A-Za-z_?\$\@][\w?\$\@]*/;
+my $no_id_before = qr/(?<![\w?\$\@])/;
+my $no_id_after  = qr/(?![\w?\$\@])/;
+
+
+my @log;
+my %count;
+
+sub note ($file, $line, $rule, $old, $new) {
+  return if $old eq $new;
+  push @log, "$file($line) $rule: $old => $new";
+  $count{$rule}++;
+}
+
+# Split code from its trailing comment, ignoring ';' inside quotes.
+sub split_comment ($text) {
+  my $q;
+  for my $i (0 .. length($text) - 1) {
+    my $c = substr $text, $i, 1;
+    if(defined $q) { undef $q if $c eq $q }
+    elsif($c eq '"' || $c eq "'") { $q = $c }
+    elsif($c eq ';') { return (substr($text, 0, $i), substr($text, $i)) }
+  }
+  return ($text, '');
+}
+
+# Apply $fn to the unquoted parts of $text.
+sub outside_quotes ($text, $fn) {
+  my @parts = split /("[^"]*"|'[^']*')/, $text;
+  for my $i (0 .. $#parts) {
+    $parts[$i] = $fn->($parts[$i]) unless $i % 2;
+  }
+  return join '', @parts;
+}
+
+sub rename_in ($text, $set) {
+  outside_quotes($text, sub ($t) {
+    $t =~ s/$no_id_before($id)$no_id_after/exists $set->{uc $1} ? "$1_" : $1/ger;
+  });
+}
+
+sub rewrite_line ($file, $n, $line) {
+  my ($code, $comment) = split_comment($line);
+  my $orig = $code;
+
+  # Optional leading label.
+  my ($label, $rest) = ('', $code);
+  if($code =~ /^(\s*$id\s*:)(?!:)(.*)$/s) {
+    ($label, $rest) = ($1, $2);
+    $label = rename_in($label, \%sym);
+  }
+
+  my ($ws, $first, $tail) = $rest =~ /^(\s*)($id)?(.*)$/s;
+  $first //= '';
+  my $ufirst = uc $first;
+
+  if($ufirst =~ /^(?:Q|QF|T|UN_DEF|TITLE|SUBTTL|PAGE|%OUT)$/ || $rest =~ /^\s*%OUT\b/i) {
+    # Reserved-word table text, listing titles and messages: leave alone.
+  }
+  elsif($ufirst eq 'R' && $tail =~ /^(\s+)($id)(\s*)$/ && $sym{uc $2}) {
+    my ($sp, $arg, $end) = ($1, $2, $3);
+    $first = 'R2';
+    $tail  = "$sp$arg,${arg}_$end";
+    note($file, $n, 'r-to-r2', "R $arg", "R2 $arg,${arg}_");
+  }
+  elsif($ufirst eq 'R2' && $tail =~ /^(\s+$id\s*,)(.*)$/s) {
+    $tail = $1 . rename_in($2, \%sym);
+  }
+  else {
+    my $assign = $tail =~ /^\s*(?:=|EQU\b)/i;
+    my $cond   = $ufirst =~ /^(?:IF|IFE|ELSEIF|ELSEIFE|IFDEF|IFNDEF)$/;
+    if($assign || $cond) {
+      $first = "${first}_" if $assign && ($sym{$ufirst} || $swit{$ufirst});
+      $tail = rename_in($tail, { %sym, %swit });
+    }
+    else {
+      # An instruction word in mnemonic position stays; anywhere else it is
+      # a symbol.
+      $first = "${first}_" if $sym{$ufirst} && !$insn{$ufirst};
+      $tail = rename_in($tail, \%sym);
+    }
+  }
+
+  $code = "$label$ws$first$tail";
+  note($file, $n, 'rename', trim($orig), trim($code))
+    unless $orig eq $code || $code =~ /\bR2\b/ && $orig =~ /^\s*R\s/;
+
+  # DB OFFSET X  ->  DB LOW (OFFSET X);  MOV DL,OFFSET X  ->  MOV DL,LOW (OFFSET X)
+  my $before = $code;
+  my $sym_amp = qr/[A-Za-z_?\$\@&][\w?\$\@&]*/;
+  $code =~ s/\bDB(\s+)OFFSET\s+($sym_amp)/DB$1LOW (OFFSET $2)/i
+    or $code =~ s/(\b(?:MOV|CMP|ADD|SUB|AND|OR|XOR|TEST)\s+(?:AL|AH|BL|BH|CL|CH|DL|DH)\s*,\s*)OFFSET\s+($sym_amp)/$1LOW (OFFSET $2)/i;
+  note($file, $n, 'byte-offset', trim($before), trim($code));
+
+  $before = $code;
+  $code =~ s/\bMOVS(\s+)\?CSLAB\s*,\s*WORD\s+PTR\s+\?CSLAB/MOVS$1WORD PTR ES:[DI],WORD PTR CS:[SI]/i;
+  note($file, $n, 'movs-cs', trim($before), trim($code));
+
+  return $code . $comment;
+}
+
+sub slurp ($path) {
+  open my $fh, '<:raw', $path or die "$path: $!";
+  local $/;
+  return scalar <$fh>;
+}
+
+sub spew ($path, $data) {
+  open my $fh, '>:raw', $path or die "$path: $!";
+  print $fh $data;
+}
+
+sub prepare ($name, $data) {
+  my @lines = split /(?<=\n)/, $data;
+  my $in_comment;
+  my $n = 0;
+  for my $line (@lines) {
+    $n++;
+    my ($body, $eol) = $line =~ /^(.*?)(\r?\n)?$/s;
+    $eol //= '';
+    if(defined $in_comment) {
+      undef $in_comment if index($body, $in_comment) >= 0;
+      next;
+    }
+    if($body =~ /^\s*COMMENT\s+(\S)(.*)$/i) {
+      my ($delim, $after) = ($1, $2);
+      $in_comment = $delim unless index($after, $delim) >= 0;
+      next;
+    }
+    $line = rewrite_line($name, $n, $body) . $eol;
+  }
+  forward_equate($name, \@lines) if $forward_files{$name};
+  marker_equate(\@lines)  if $name eq 'BINTRP.H';
+  return join '', @lines;
+}
+
+sub marker_equate ($lines) {
+  my ($i) = grep { $lines->[$_] =~ /^\?&s macro\s*$/ && $lines->[$_ + 1] =~ /^&endm\s*$/ } 0 .. $#$lines - 1;
+  die "BINTRP.H: ?&s macro / &endm not found\n" unless defined $i;
+  my $eol = $lines->[$i] =~ /(\r?\n)$/ ? $1 : '';
+  splice @$lines, $i, 2, "?&s = 1$eol";
+  note('BINTRP.H', $i + 1, 'marker-equate', '?&s macro / &endm', '?&s = 1');
+}
+
+# Move "NAME=expr" below the definitions it uses (files in %forward_files).
+
+sub defined_at ($lines) {
+  my %at;
+  for my $i (0 .. $#$lines) {
+    my ($code) = split_comment($lines->[$i]);
+    my $name;
+    if($code =~ /^\s*($id)\s*(?::|=)/ || $code =~ /^\s*($id)\s+(?:DB|DW|DD|LABEL|EQU|PROC)\b/i) {
+      $name = uc $1;
+    }
+    $at{$name} //= $i if defined $name && $name ne '$';
+  }
+  return \%at;
+}
+
+sub forward_equate ($file, $lines) {
+  for (1 .. 1000) {
+    my $at = defined_at($lines);
+    my ($from, $to);
+    for my $i (0 .. $#$lines) {
+      my ($code) = split_comment($lines->[$i]);
+      next unless $code =~ /^\s*($id)\s*=(?!=)\s*(.*)$/s;
+      my $expr = $2;
+      my @deps = grep { $_ ne '$' && defined $at->{$_} && $at->{$_} > $i }
+                 map { uc } $expr =~ /$no_id_before($id)$no_id_after/g;
+      next unless @deps;
+      ($from, $to) = ($i, (sort { $b <=> $a } map { $at->{$_} } @deps)[0]);
+      last;
+    }
+    return unless defined $from;
+    my $text = trim(scalar((split_comment($lines->[$from]))[0]));
+    my ($moved) = splice @$lines, $from, 1;
+    splice @$lines, $to, 0, $moved;    # $to now indexes the line after its last dependency
+    note($file, $from + 1, 'forward-equate', $text, 'moved below line ' . ($to + 1));
+  }
+  die "$file: forward-equate did not settle\n";
+}
+
+remove_tree($dest);
+make_path($dest);
+
+opendir my $dh, $src or die "$src: $!";
+my @files = sort grep { -f "$src/$_" } readdir $dh;
+
+for my $f (@files) {
+  next if $f =~ /\.md$/ || $f eq '.gitignore';
+  my $data = slurp("$src/$f");
+  if($f =~ /\.ASM$/ || $f =~ /\.H$/ || $f eq 'GIO86U' || $f eq 'MSDOSU') {
+    next if $f eq 'MATH1.ASM' || $f eq 'MATH2.ASM';
+    $data = prepare($f, $data);
+  }
+  spew("$dest/$f", $data);
+}
+
+my $math1 = slurp("$src/MATH1.ASM") =~ s/\0+\z//r;
+my $math2 = slurp("$src/MATH2.ASM");
+$math1 .= "\r\n" unless $math1 =~ /\n\z/;
+note('MATH.ASM', 0, 'join-math', 'MATH1.ASM + MATH2.ASM', 'MATH.ASM');
+spew("$dest/MATH.ASM", prepare('MATH.ASM', $math1 . $math2));
+
+open my $log, '>', "$dest/PREPARE.LOG" or die $!;
+say $log $_ for @log;
+say $log "";
+say $log sprintf "%-14s %d", "$_:", $count{$_} for sort keys %count;
+close $log;

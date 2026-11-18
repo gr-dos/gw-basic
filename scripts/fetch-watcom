@@ -1,0 +1,16 @@
+#!/bin/sh
+#
+# Download GR-DOS's pinned Open Watcom snapshot, for wlink
+# (scripts/fetch-grdos). Prints the WATCOM directory on stdout.
+#
+# usage: scripts/fetch-watcom [DESTDIR]     (default: build/tools)
+
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+dest=${1:-"$root/build/tools"}
+grdos=$("$root/scripts/fetch-grdos" "$dest")
+# GR-DOS's script can print a sha256sum notice on stdout before the
+# directory when the tarball is not downloaded yet; keep only the last line.
+out=$("$grdos/scripts/fetch-watcom" "$dest")
+printf '%s\n' "$out" | tail -n 1

@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# Check that upstream/ is still byte-for-byte Microsoft's GW-BASIC at the
+# pinned commit: its committed git tree must equal upstream's root tree
+# (docs/provenance.md). Checks the index, so it works before a commit too.
+#
+# usage: scripts/check-upstream
+
+set -eu
+
+commit=edf82c2ebf6bfe099c2054e0ae125c3efe5769c4
+tree=da3c09bb336705cf166739c8bb50c99e4434f328
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+have=$(git write-tree --prefix=upstream/)
+if [ "$have" != "$tree" ]; then
+  echo "upstream/ tree is $have, expected $tree (microsoft/GW-BASIC $commit)" >&2
+  exit 1
+fi
+if ! git diff --quiet -- upstream || [ -n "$(git ls-files --others -- upstream)" ]; then
+  echo "upstream/ differs from what is staged or committed:" >&2
+  git diff --stat -- upstream >&2
+  git ls-files --others -- upstream >&2
+  exit 1
+fi
+echo "upstream/ matches microsoft/GW-BASIC $commit (tree $tree)"

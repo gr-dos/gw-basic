@@ -1,0 +1,42 @@
+# Check the vendored source and the M0 analysis (docs/DESIGN.md): upstream/
+# is byte-for-byte microsoft/GW-BASIC, every module assembles with GR-DOS's
+# JWasm, and docs/symbols.md is current and agrees with a trial link.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: shogo82148/actions-setup-perl@a99edab616eaa8a66bbc16363c77a83361e5f2ce # v1.44.3
+        with:
+          perl-version: 5.42.3
+          enable-modules-cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/tools
+          key: tools-ubuntu-24.04-${{ hashFiles('scripts/fetch-grdos', 'scripts/fetch-jwasm', 'scripts/fetch-watcom') }}
+
+      - name: Fetch tools
+        run: |
+          scripts/fetch-jwasm
+          scripts/fetch-watcom
+
+      - name: Check
+        run: make check
