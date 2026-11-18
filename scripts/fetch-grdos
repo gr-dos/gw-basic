@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# Fetch the parts of GR-DOS that pin our toolchain: its fetch-jwasm and
+# fetch-watcom scripts and its JWasm patches, at a pinned commit. GW-BASIC
+# builds with exactly the assembler and linker GR-DOS uses (docs/DESIGN.md).
+# Prints the checkout directory on stdout. Reuses an existing checkout.
+#
+# usage: scripts/fetch-grdos [DESTDIR]     (default: build/tools)
+
+set -eu
+
+commit=424fcfef6630ac4e52b71c3b4575522b345e5a6f
+repo=https://github.com/gr-dos/gr-dos.git
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+dest=${1:-"$root/build/tools"}
+dir="$dest/gr-dos-$(echo "$commit" | cut -c1-12)"
+
+if [ ! -f "$dir/.fetched" ]; then
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" sparse-checkout set --no-cone \
+    /scripts/fetch-jwasm /scripts/fetch-watcom /patches/jwasm/
+  git -C "$dir" fetch -q --depth 1 --filter=blob:none "$repo" "$commit"
+  git -C "$dir" checkout -q FETCH_HEAD
+  [ "$(git -C "$dir" rev-parse HEAD)" = "$commit" ]
+  touch "$dir/.fetched"
+fi
+
+echo "$dir"

@@ -1,0 +1,183 @@
+#!/usr/bin/env perl
+
+use 5.042;
+use warnings;
+
+# ABSTRACT: Report external symbols that no upstream module defines
+
+=head1 SYNOPSIS
+
+ scripts/symbol-report SRCDIR OBJDIR > docs/symbols.md
+
+=head1 DESCRIPTION
+
+Reads the 16-bit OMF objects in OBJDIR, assembled from the prepared tree in
+SRCDIR (C<scripts/prepare-tree>), and lists every symbol that some module
+declares external (C<EXTDEF>) but no module makes public (C<PUBDEF>). These
+are what the OEM layer in C<src/oem/> has to supply.
+
+Because it reads the assembler's output, macro-generated publics (the
+reserved-word token values C<$PRINT>, ..., and the error entry points
+C<DERxxx>) count as defined. Each unresolved symbol is classified as a
+routine or as data from its C<EXTRN> declaration in the source, and placed
+in a subsystem by the modules that reference it.
+
+The output is Markdown and deterministic, so CI can regenerate it and fail
+if the committed C<docs/symbols.md> is out of date.
+
+=cut
+
+my ($srcdir, $objdir) = @ARGV;
+die "usage: $0 SRCDIR OBJDIR\n" unless defined $objdir;
+
+# Names that scripts/prepare-tree renamed with a trailing "_".
+my %renamed = map { $_ => 1 } qw(
+  PUSHF IDIV INT NEG LOOP FDIV FCOMP FADD FSUB FFREE
+  NAME OPTION FOR WHILE GOTO INSTR
+);
+
+sub original ($name) {
+  my $base = $name =~ s/_\z//r;
+  return $base ne $name && $renamed{$base} ? $base : $name;
+}
+
+sub index_field ($data, $pos) {
+  my $b = ord substr($$data, $$pos++, 1);
+  return $b unless $b & 0x80;
+  return (($b & 0x7f) << 8) | ord substr($$data, $$pos++, 1);
+}
+
+sub counted ($data, $pos) {
+  my $len = ord substr($$data, $$pos++, 1);
+  my $s = substr($$data, $$pos, $len);
+  $$pos += $len;
+  return $s;
+}
+
+sub read_omf ($path) {
+  open my $fh, '<:raw', $path or die "$path: $!";
+  local $/;
+  my $obj = <$fh>;
+  my (@ext, @pub);
+  my $pos = 0;
+  while($pos + 3 <= length $obj) {
+    my ($type, $len) = unpack 'C v', substr($obj, $pos, 3);
+    my $body = substr($obj, $pos + 3, $len - 1);    # without checksum
+    $pos += 3 + $len;
+    my $p = 0;
+    if($type == 0x8C) {                             # EXTDEF
+      while($p < length $body) {
+        push @ext, counted(\$body, \$p);
+        index_field(\$body, \$p);
+      }
+    }
+    elsif($type == 0x90 || $type == 0x91) {         # PUBDEF
+      my $off = $type == 0x91 ? 4 : 2;
+      index_field(\$body, \$p);                     # group
+      my $seg = index_field(\$body, \$p);
+      $p += 2 if $seg == 0;                         # frame
+      while($p < length $body) {
+        push @pub, counted(\$body, \$p);
+        $p += $off;
+        index_field(\$body, \$p);
+      }
+    }
+    elsif($type == 0xB0) {                          # COMDEF: defines the name
+      die "$path: COMDEF not supported\n";
+    }
+    last if $type == 0x8A || $type == 0x8B;         # MODEND
+  }
+  return (\@ext, \@pub);
+}
+
+# EXTRN declarations in the prepared source give each symbol's kind.
+sub extrn_kinds ($dir) {
+  my %kind;
+  opendir my $dh, $dir or die "$dir: $!";
+  for my $f (sort grep { /\.(?:ASM|H)\z/ || $_ eq 'GIO86U' || $_ eq 'MSDOSU' } readdir $dh) {
+    open my $fh, '<:raw', "$dir/$f" or die "$dir/$f: $!";
+    while(my $line = <$fh>) {
+      $line =~ s/\r?\n\z//;
+      $line =~ s/;.*//;
+      next unless $line =~ /^\s*EXTRN\s+(.*)$/i;
+      for my $decl (split /,/, $1) {
+        next unless $decl =~ /^\s*([^:\s]+)\s*:\s*(\w+)/;
+        $kind{uc $1} //= uc $2;
+      }
+    }
+  }
+  return \%kind;
+}
+
+# Subsystem by referencing module, most specific first.
+my @subsystems = (
+  [ 'Screen and text editor' => qw( SCNDRV SCNEDT GIOSCN GIOCON ) ],
+  [ 'Keyboard'               => qw( GIOKYB ) ],
+  [ 'Graphics'               => qw( ADVGRP GENGRP ) ],
+  [ 'Sound and music'        => qw( MACLNG ) ],
+  [ 'Serial (COM)'           => qw( GIOCOM ) ],
+  [ 'Printer (LPT)'          => qw( GIOLPT ) ],
+  [ 'Cassette'               => qw( GIOCAS ) ],
+  [ 'Disk and device I/O'    => qw( GIO86 GIODSK DSKCOM GIOTBL ) ],
+  [ 'IBM PC statements in GWSTS (COLOR, LOCATE, SOUND, PEN, STICK, ...)' => qw( GWSTS ) ],
+  [ 'Initialisation and core' => qw( GWINIT GWMAIN GWDATA GWRAM GWEVAL GWLIST BIMISC BIPRTU BIPTRG BISTRS BIBOOT CALL86 FIVEO IBMRES ITSA86 KANJ86 MATH NEXT86 ) ],
+);
+my %rank;
+for my $i (0 .. $#subsystems) {
+  my ($name, @mods) = $subsystems[$i]->@*;
+  $rank{$_} = $i for @mods;
+}
+
+opendir my $dh, $objdir or die "$objdir: $!";
+my @objs = sort grep { /\.OBJ\z/i } readdir $dh;
+die "$objdir: no objects\n" unless @objs;
+
+my (%refs, %public);
+for my $o (@objs) {
+  my $mod = uc($o =~ s/\.OBJ\z//ir);
+  my ($ext, $pub) = read_omf("$objdir/$o");
+  $public{uc $_} = 1 for @$pub;
+  push $refs{uc $_}->@*, $mod for @$ext;
+}
+
+my $kinds = extrn_kinds($srcdir);
+my %groups;
+for my $sym (sort keys %refs) {
+  next if $public{$sym};
+  my @mods = sort { ($rank{$a} // 99) <=> ($rank{$b} // 99) || $a cmp $b } $refs{$sym}->@*;
+  my $group = defined $rank{$mods[0]} ? $subsystems[$rank{$mods[0]}][0] : 'Other';
+  my $k = $kinds->{$sym} // '?';
+  my $kind = $k =~ /^(?:NEAR|FAR|PROC)\z/ ? 'routine' : $k eq '?' ? '?' : "data ($k)";
+  push $groups{$group}->@*, [ original($sym), $kind, join ' ', sort @mods ];
+}
+
+my $total = 0;
+$total += $_->@* for values %groups;
+my $routines = grep { $_->[1] eq 'routine' } map { @$_ } values %groups;
+
+say "# Unresolved external symbols";
+say "";
+say "Generated by `make symbols` (`scripts/symbol-report`). Do not edit by hand.";
+say "";
+say "Upstream `edf82c2`, prepared by `scripts/prepare-tree` and assembled by JWasm: "
+  . scalar(@objs) . " modules. $total symbols are declared `EXTRN` but made `PUBLIC` "
+  . "by no module: $routines routines and " . ($total - $routines) . " data items. "
+  . "These are what the OEM layer in `src/oem/` must define.";
+say "";
+say "Names that `prepare-tree` renamed (for example `PUSHF` to `PUSHF_`) are shown by their upstream name.";
+say "";
+say "| Subsystem | Symbols |";
+say "| --- | --- |";
+for my $s (map { $_->[0] } @subsystems, ['Other']) {
+  next unless $groups{$s};
+  say "| $s | " . scalar($groups{$s}->@*) . " |";
+}
+for my $s (map { $_->[0] } @subsystems, ['Other']) {
+  next unless $groups{$s};
+  say "";
+  say "## $s";
+  say "";
+  say "| Symbol | Kind | Referenced by |";
+  say "| --- | --- | --- |";
+  say "| `$_->[0]` | $_->[1] | $_->[2] |" for sort { $a->[0] cmp $b->[0] } $groups{$s}->@*;
+}
