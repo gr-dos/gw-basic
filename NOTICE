@@ -1,0 +1,15 @@
+GW-BASIC for GR-DOS
+
+This repository combines work under two MIT licenses.
+
+upstream/
+    Microsoft GW-BASIC interpreter source, as of 1983, unmodified, from
+    https://github.com/microsoft/GW-BASIC at commit
+    edf82c2ebf6bfe099c2054e0ae125c3efe5769c4.
+    Copyright (c) Microsoft Corporation. MIT License: upstream/LICENSE.
+
+Everything else (scripts/, docs/, Makefile and, from milestone M1, src/oem/)
+    Copyright (c) 2026 Graham Ollis. MIT License: LICENSE.
+
+The build fetches, but does not include or redistribute, JWasm and Open
+Watcom (Sybase Open Watcom Public License); see docs/provenance.md.
